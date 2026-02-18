@@ -12,39 +12,80 @@ import {
 import fs from "fs";
 import path from "path";
 
+/**
+ * 高成交网格：Pyth 触发 + Jupiter Ultra 成交
+ * - 修复：严格选择 SOL/USD（避免选到 MSOL/USD 等衍生品）
+ * - 支持：可在 env 里直接指定 PYTH_PRICE_ID 来彻底避免选错
+ *
+ * 依赖：
+ *   npm i dotenv bs58 node-fetch socks-proxy-agent @solana/web3.js
+ *
+ * 建议 package.json 加：
+ *   { "type": "module" }
+ */
+
 // =======================
 // 配置
 // =======================
 const RPC_URL = process.env.SOL_RPC_URL || "https://api.mainnet-beta.solana.com";
-const USDC_MINT = process.env.USDC_MINT || "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-const SOL_MINT = "So11111111111111111111111111111111111111112";
+
+const USDC_MINT =
+    process.env.USDC_MINT ||
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const SOL_MINT =
+    process.env.SOL_MINT ||
+    "So11111111111111111111111111111111111111112";
 
 const JUP_API_KEY = process.env.JUP_API_KEY || "";
-const JUP_BASE = "https://api.jup.ag/ultra/v1";
+const JUP_BASE = process.env.JUP_BASE || "https://api.jup.ag/ultra/v1";
 
-const GRID_COUNT = parseInt(process.env.GRID_COUNT || "10", 10);
-const GRID_RANGE_PERCENT = parseFloat(process.env.GRID_RANGE_PERCENT || "10");
+const PYTH_HERMES_URL =
+    process.env.PYTH_HERMES_URL || "https://hermes.pyth.network";
+const PYTH_QUERY = process.env.PYTH_QUERY || "SOL/USD";
+const PYTH_ASSET_TYPE = process.env.PYTH_ASSET_TYPE || "crypto";
+// 可选：直接指定 price id，最稳
+const PYTH_PRICE_ID = (process.env.PYTH_PRICE_ID || "").trim();
 
-const MIN_TRADE_SOL = parseFloat(process.env.MIN_TRADE_SOL || "0.002");
-const MAX_TRADE_SOL = parseFloat(process.env.MAX_TRADE_SOL || "0.006");
+const GRID_COUNT = parseInt(process.env.GRID_COUNT || "60", 10);
+const GRID_RANGE_PERCENT = parseFloat(process.env.GRID_RANGE_PERCENT || "4");
 
-const PRICE_CHECK_INTERVAL_MS = parseInt(process.env.PRICE_CHECK_INTERVAL_MS || "30000", 10);
-const MAX_TRADES_PER_TICK = parseInt(process.env.MAX_TRADES_PER_TICK || "2", 10);
-const POST_TRADE_COOLDOWN_MS = parseInt(process.env.POST_TRADE_COOLDOWN_MS || "1500", 10);
+const PRICE_CHECK_INTERVAL_MS = parseInt(
+    process.env.PRICE_CHECK_INTERVAL_MS || "5000",
+    10
+);
 
-const MIN_BALANCE_SOL = parseFloat(process.env.MIN_BALANCE_SOL || "0.01");
+const MIN_TRADE_SOL = parseFloat(process.env.MIN_TRADE_SOL || "0.0006");
+const MAX_TRADE_SOL = parseFloat(process.env.MAX_TRADE_SOL || "0.0015");
 
-const TARGET_USDC_BUFFER = parseFloat(process.env.TARGET_USDC_BUFFER || "5");
-const MIN_SOL_KEEP = parseFloat(process.env.MIN_SOL_KEEP || "0.08");
+const MAX_POS_PER_LEVEL = parseInt(process.env.MAX_POS_PER_LEVEL || "3", 10);
+const MAX_TRADES_PER_TICK = parseInt(process.env.MAX_TRADES_PER_TICK || "3", 10);
+const POST_TRADE_COOLDOWN_MS = parseInt(
+    process.env.POST_TRADE_COOLDOWN_MS || "800",
+    10
+);
+
+const MIN_BALANCE_SOL = parseFloat(process.env.MIN_BALANCE_SOL || "0.02");
+
+const TARGET_USDC_BUFFER = parseFloat(process.env.TARGET_USDC_BUFFER || "8");
+const MIN_SOL_KEEP = parseFloat(process.env.MIN_SOL_KEEP || "0.10");
+
+const REGRID_OUTSIDE_PCT = parseFloat(process.env.REGRID_OUTSIDE_PCT || "0.8");
+const REGRID_COOLDOWN_MS = parseInt(
+    process.env.REGRID_COOLDOWN_MS || "1800000",
+    10
+);
 
 const USDC_DECIMALS = 1_000_000;
 
 if (!process.env.SOL_PRIVATE_KEYS) throw new Error("❌ .env 中 SOL_PRIVATE_KEYS 为空");
 if (!JUP_API_KEY) throw new Error("❌ .env 中 JUP_API_KEY 为空");
-
-if (GRID_COUNT < 2) throw new Error("❌ GRID_COUNT 建议 >= 2");
 if (GRID_RANGE_PERCENT <= 0) throw new Error("❌ GRID_RANGE_PERCENT 必须 > 0");
-if (MIN_TRADE_SOL <= 0 || MAX_TRADE_SOL <= 0 || MIN_TRADE_SOL > MAX_TRADE_SOL) {
+if (GRID_COUNT < 10) throw new Error("❌ GRID_COUNT 太小（高成交建议 >= 30）");
+if (
+    MIN_TRADE_SOL <= 0 ||
+    MAX_TRADE_SOL <= 0 ||
+    MIN_TRADE_SOL > MAX_TRADE_SOL
+) {
     throw new Error("❌ MIN_TRADE_SOL/MAX_TRADE_SOL 配置不合法");
 }
 
@@ -52,26 +93,21 @@ if (MIN_TRADE_SOL <= 0 || MAX_TRADE_SOL <= 0 || MIN_TRADE_SOL > MAX_TRADE_SOL) {
 // 代理（可选）
 // =======================
 const rawProxies = process.env.SOL_PROXIES || "";
-const proxyList = rawProxies.split(",").map((p) => p.trim()).filter(Boolean);
+const proxyList = rawProxies
+    .split(",")
+    .map((p) => p.trim())
+    .filter(Boolean);
 
 function buildProxyAgent(proxyStr) {
     const [host, port, user, pass] = proxyStr.split(":");
     return new SocksProxyAgent(`socks5h://${user}:${pass}@${host}:${port}`);
 }
 
-// =======================
-// 工具：随机数/文件状态
-// =======================
-function randFloat(min, max) {
-    return min + Math.random() * (max - min);
-}
-function clamp(x, min, max) {
-    return Math.max(min, Math.min(max, x));
-}
-function sleep(ms) {
-    return new Promise((r) => setTimeout(r, ms));
-}
+const proxyAgent = proxyList.length ? buildProxyAgent(proxyList[0]) : null;
 
+// =======================
+// 文件状态
+// =======================
 const STATE_DIR = path.resolve(process.cwd(), "state");
 if (!fs.existsSync(STATE_DIR)) fs.mkdirSync(STATE_DIR, { recursive: true });
 
@@ -88,12 +124,34 @@ function saveState(pubkeyStr, state) {
 }
 
 // =======================
+// 工具
+// =======================
+function sleep(ms) {
+    return new Promise((r) => setTimeout(r, ms));
+}
+function randFloat(min, max) {
+    return min + Math.random() * (max - min);
+}
+function clamp(x, min, max) {
+    return Math.max(min, Math.min(max, x));
+}
+function todayStrLocal() {
+    const d = new Date();
+    const yyyy = d.getFullYear();
+    const mm = String(d.getMonth() + 1).padStart(2, "0");
+    const dd = String(d.getDate()).padStart(2, "0");
+    return `${yyyy}-${mm}-${dd}`;
+}
+
+// =======================
 // 账户加载（单钱包）
 // =======================
-const keyList = process.env.SOL_PRIVATE_KEYS.split(",").map((k) => k.trim()).filter(Boolean);
-const kp = Keypair.fromSecretKey(bs58.decode(keyList[0]));
+const keyList = process.env.SOL_PRIVATE_KEYS
+    .split(",")
+    .map((k) => k.trim())
+    .filter(Boolean);
 
-const proxyAgent = proxyList.length > 0 ? buildProxyAgent(proxyList[0]) : null;
+const kp = Keypair.fromSecretKey(bs58.decode(keyList[0]));
 
 const connection = new Connection(RPC_URL, {
     commitment: "confirmed",
@@ -105,12 +163,12 @@ const connection = new Connection(RPC_URL, {
 const worker = {
     label: "W1",
     keypair: kp,
-    proxyAgent,
     connection,
+    proxyAgent,
 };
 
 // =======================
-// fetch: retry + timeout
+// fetch with retry + timeout
 // =======================
 async function fetchJsonWithRetry(url, options = {}, retries = 3, timeoutMs = 15000) {
     for (let i = 0; i < retries; i++) {
@@ -124,7 +182,11 @@ async function fetchJsonWithRetry(url, options = {}, retries = 3, timeoutMs = 15
             if (res.ok) return await res.json();
 
             if (res.status === 429) {
-                await sleep(2000 + i * 1500);
+                const backoff = 800 + i * 1200;
+                console.warn(
+                    `Server responded with 429 Too Many Requests. Retrying after ${backoff}ms delay...`
+                );
+                await sleep(backoff);
                 continue;
             }
 
@@ -133,7 +195,7 @@ async function fetchJsonWithRetry(url, options = {}, retries = 3, timeoutMs = 15
         } catch (e) {
             clearTimeout(t);
             if (i === retries - 1) throw e;
-            await sleep(1200 + i * 1000);
+            await sleep(800 + i * 800);
         }
     }
 }
@@ -188,28 +250,18 @@ async function executeOrder(w, signedTransaction, requestId) {
     });
 }
 
-// =======================
-// 价格：用 1 SOL -> USDC 报价推算
-// =======================
-async function getSOLPrice(w) {
-    const order = await getOrder(w, SOL_MINT, USDC_MINT, LAMPORTS_PER_SOL);
-    if (!order || !order.outAmount) throw new Error("无法获取 SOL 价格报价");
-    return parseInt(order.outAmount, 10) / USDC_DECIMALS;
-}
-
-// =======================
-// 交易确认
-// =======================
 async function confirmSignature(w, signature, timeoutMs = 60000) {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
-        const st = await w.connection.getSignatureStatuses([signature], { searchTransactionHistory: true });
+        const st = await w.connection.getSignatureStatuses([signature], {
+            searchTransactionHistory: true,
+        });
         const s = st?.value?.[0];
         if (s) {
             if (s.err) throw new Error(`链上失败: ${JSON.stringify(s.err)}`);
             if (s.confirmationStatus === "confirmed" || s.confirmationStatus === "finalized") return true;
         }
-        await sleep(2000);
+        await sleep(2500);
     }
     throw new Error("确认超时：交易未在限定时间内 confirmed");
 }
@@ -228,7 +280,6 @@ async function doSwap(w, inputMint, outputMint, amount, label) {
 
     const res = await executeOrder(w, signedTx, order.requestId);
 
-    // 严格判定
     if (!res || res.status !== "Success" || !res.signature) {
         console.error(`[${w.label}] ❌ ${label} 执行失败:`, JSON.stringify(res));
         return { ok: false };
@@ -242,6 +293,98 @@ async function doSwap(w, inputMint, outputMint, amount, label) {
 }
 
 // =======================
+// Pyth Hermes：发现 priceId + 取最新价格
+// =======================
+function isDerivativeSolSymbolOrDesc(symUpper, descUpper) {
+    // 常见 SOL 衍生：mSOL / bSOL / jitoSOL / stSOL / etc.
+    const badTokens = ["MSOL", "BSOL", "JITOSOL", "STSOL", "INF", "LST", "STAKED"];
+    if (badTokens.some((t) => symUpper.includes(t))) return true;
+    if (descUpper.includes("MARINADE STAKED SOL")) return true;
+    if (descUpper.includes("STAKED SOL")) return true; // 宽一点避免误选
+    return false;
+}
+
+async function resolvePythPriceIdStrict() {
+    // 允许直接指定，最稳
+    if (PYTH_PRICE_ID) {
+        return { id: PYTH_PRICE_ID, meta: { attributes: { symbol: "ENV_OVERRIDE", description: "PYTH_PRICE_ID" } } };
+    }
+
+    const url =
+        `${PYTH_HERMES_URL}/v2/price_feeds` +
+        `?query=${encodeURIComponent(PYTH_QUERY)}` +
+        `&asset_type=${encodeURIComponent(PYTH_ASSET_TYPE)}`;
+
+    const feeds = await fetchJsonWithRetry(url, {}, 3, 15000);
+
+    if (!Array.isArray(feeds) || feeds.length === 0) {
+        throw new Error(`❌ Hermes 未找到 price feed: query=${PYTH_QUERY}, asset_type=${PYTH_ASSET_TYPE}`);
+    }
+
+    // 1) 最优：description 精确是 SOLANA / US DOLLAR（或包含）
+    const byDesc = feeds.find((f) => {
+        const desc = String(f?.attributes?.description || "").toUpperCase();
+        const sym = String(f?.attributes?.symbol || "").toUpperCase();
+        if (isDerivativeSolSymbolOrDesc(sym, desc)) return false;
+        return desc === "SOLANA / US DOLLAR" || desc.includes("SOLANA / US DOLLAR");
+    });
+
+    // 2) 次优：symbol 精确匹配 Crypto.SOL/USD（大小写不敏感）
+    const bySymbolExact = feeds.find((f) => {
+        const sym = String(f?.attributes?.symbol || "").toUpperCase();
+        const desc = String(f?.attributes?.description || "").toUpperCase();
+        if (isDerivativeSolSymbolOrDesc(sym, desc)) return false;
+        return sym === "CRYPTO.SOL/USD" || sym.endsWith(".SOL/USD");
+    });
+
+    // 3) 兜底：包含 SOL/USD，但过滤衍生
+    const byContains = feeds.find((f) => {
+        const sym = String(f?.attributes?.symbol || "").toUpperCase();
+        const desc = String(f?.attributes?.description || "").toUpperCase();
+        if (isDerivativeSolSymbolOrDesc(sym, desc)) return false;
+        return sym.includes("SOL/USD") || desc.includes("SOL / US DOLLAR") || desc.includes("SOLANA");
+    });
+
+    const pick = byDesc || bySymbolExact || byContains;
+
+    if (!pick?.id) {
+        console.log("Hermes candidates (first 30):");
+        for (const f of feeds.slice(0, 30)) {
+            console.log("-", f.id, f.attributes?.symbol, f.attributes?.description);
+        }
+        throw new Error("❌ 无法从 Hermes 候选中定位 SOL/USD（已打印候选）");
+    }
+
+    return { id: pick.id, meta: pick };
+}
+
+async function getPythPrice(priceId) {
+    const url = new URL(`${PYTH_HERMES_URL}/v2/updates/price/latest`);
+    url.searchParams.append("ids[]", priceId);
+
+    const data = await fetchJsonWithRetry(url.toString(), {}, 3, 15000);
+
+    const parsed = data?.parsed;
+    if (!Array.isArray(parsed) || parsed.length === 0) {
+        throw new Error(`❌ Hermes 返回无 parsed 数据: ${JSON.stringify(data).slice(0, 300)}`);
+    }
+
+    const p = parsed[0]?.price;
+    const priceInt = Number(p?.price);
+    const expo = Number(p?.expo);
+
+    if (!Number.isFinite(priceInt) || !Number.isFinite(expo)) {
+        throw new Error(`❌ Hermes price 格式异常: ${JSON.stringify(parsed[0]).slice(0, 300)}`);
+    }
+
+    const price = priceInt * Math.pow(10, expo);
+    const publishTime = p?.publish_time ? Number(p.publish_time) : null;
+
+    if (!Number.isFinite(price) || price <= 0) throw new Error("❌ Hermes 价格计算异常");
+    return { price, publishTime };
+}
+
+// =======================
 // 网格 + 状态
 // =======================
 function initGrid(basePrice) {
@@ -251,41 +394,44 @@ function initGrid(basePrice) {
 
     const levels = [];
     for (let i = 0; i <= GRID_COUNT; i++) {
-        levels.push({
-            index: i,
-            price: parseFloat((low + step * i).toFixed(4)),
-        });
+        levels.push({ index: i, price: parseFloat((low + step * i).toFixed(6)) });
     }
 
-    return { basePrice, levels };
+    return { basePrice, low, high, levels };
 }
 
 function makeEmptyState(grid, lastPrice) {
     return {
         grid,
         lastPrice,
-        positions: [], // {id, entryIndex, targetIndex, amountSol, entryPrice, createdAt}
+        positions: [],
         nextPosId: 1,
+
+        daily: { date: todayStrLocal(), trades: 0 },
+
+        lastRegridAt: null,
         lastTopUpAt: null,
     };
 }
 
-function findOpenPositionByEntryIndex(state, entryIndex) {
-    return state.positions.find((p) => p.entryIndex === entryIndex);
+function countPositionsAtLevel(state, entryIndex) {
+    return state.positions.filter((p) => p.entryIndex === entryIndex).length;
+}
+
+function bumpDailyTrades(state, n = 1) {
+    const today = todayStrLocal();
+    if (state.daily?.date !== today) state.daily = { date: today, trades: 0 };
+    state.daily.trades += n;
 }
 
 function printStatus(state, currentPrice) {
-    console.log(`\n📊 SOL=$${currentPrice.toFixed(2)} | open=${state.positions.length}`);
-    for (const p of state.positions) {
-        const tp = state.grid.levels[p.targetIndex]?.price;
-        console.log(
-            `  - P#${p.id} entry=${p.entryIndex}($${p.entryPrice}) -> target=${p.targetIndex}($${tp}) amt=${p.amountSol.toFixed(4)} SOL`
-        );
-    }
+    console.log(
+        `\n📊 Pyth SOL=$${currentPrice.toFixed(2)} | open=${state.positions.length} | dailyTrades=${state.daily?.trades ?? 0}`
+    );
 }
 
 // =======================
-// 方案B：USDC 缓冲自动补仓
+// USDC 缓冲（方案B）
 // =======================
 async function ensureUsdcBuffer(w, state, currentPrice) {
     const usdcBal = await getTokenBalanceUI(w, USDC_MINT);
@@ -293,7 +439,6 @@ async function ensureUsdcBuffer(w, state, currentPrice) {
 
     const solBal = await getBalanceSOL(w);
 
-    // 可卖 SOL：扣掉保留 SOL + gas 安全垫
     const sellableSol = solBal - MIN_SOL_KEEP - MIN_BALANCE_SOL;
     if (sellableSol <= 0) {
         console.warn(
@@ -303,13 +448,9 @@ async function ensureUsdcBuffer(w, state, currentPrice) {
     }
 
     const needUsdc = TARGET_USDC_BUFFER - usdcBal;
-
-    // 估算需要卖出多少 SOL（加5%缓冲）
     const solToSell = Math.min(sellableSol, (needUsdc / currentPrice) * 1.05);
-    if (solToSell < 0.0005) {
-        console.warn(`[${w.label}] ⚠️ 需要补的USDC很小(${needUsdc.toFixed(2)}), 不做补仓`);
-        return { ok: true, didTopUp: false, usdcBal };
-    }
+
+    if (solToSell < 0.0005) return { ok: true, didTopUp: false, usdcBal };
 
     const lamports = Math.floor(solToSell * LAMPORTS_PER_SOL);
 
@@ -320,19 +461,51 @@ async function ensureUsdcBuffer(w, state, currentPrice) {
     const r = await doSwap(w, SOL_MINT, USDC_MINT, lamports, `补USDC缓冲(目标${TARGET_USDC_BUFFER})`);
     if (!r.ok) return { ok: false, didTopUp: false, usdcBal };
 
-    const usdcBal2 = await getTokenBalanceUI(w, USDC_MINT);
-    console.log(`[${w.label}] ✅ USDC缓冲余额: ${usdcBal2.toFixed(2)} USDC`);
-
     state.lastTopUpAt = Date.now();
     saveState(w.keypair.publicKey.toBase58(), state);
 
+    const usdcBal2 = await getTokenBalanceUI(w, USDC_MINT);
+    console.log(`[${w.label}] ✅ USDC缓冲余额: ${usdcBal2.toFixed(2)} USDC`);
     return { ok: true, didTopUp: true, usdcBal: usdcBal2 };
 }
 
 // =======================
-// 核心策略：相邻层配对低买高卖
+// 网格漂移重建
+// =======================
+function shouldRegrid(state, price) {
+    const { low, high } = state.grid;
+    const upper = high * (1 + REGRID_OUTSIDE_PCT / 100);
+    const lower = low * (1 - REGRID_OUTSIDE_PCT / 100);
+    return price > upper || price < lower;
+}
+
+function canRegrid(state) {
+    if (!state.lastRegridAt) return true;
+    return Date.now() - state.lastRegridAt >= REGRID_COOLDOWN_MS;
+}
+
+function doRegrid(state, newBasePrice) {
+    state.grid = initGrid(newBasePrice);
+    state.lastRegridAt = Date.now();
+
+    // 保守处理：清空旧仓位（旧目标层对应旧网格）
+    state.positions = [];
+    state.lastPrice = newBasePrice;
+}
+
+// =======================
+// 核心策略：相邻层低买高卖（Pyth 触发）
 // =======================
 async function onTick(w, state, currentPrice) {
+    bumpDailyTrades(state, 0);
+
+    if (shouldRegrid(state, currentPrice) && canRegrid(state)) {
+        console.log(`\n🧭 价格跑出网格区间，重建网格：newBase=$${currentPrice.toFixed(2)}`);
+        doRegrid(state, currentPrice);
+        saveState(w.keypair.publicKey.toBase58(), state);
+        return 0;
+    }
+
     const lastPrice = state.lastPrice;
     if (lastPrice == null) {
         state.lastPrice = currentPrice;
@@ -341,7 +514,7 @@ async function onTick(w, state, currentPrice) {
 
     let trades = 0;
 
-    // (1) 先卖出：持仓上穿目标层就卖
+    // 1) 卖出：上穿目标层卖出
     for (const p of [...state.positions]) {
         if (trades >= MAX_TRADES_PER_TICK) break;
 
@@ -356,7 +529,6 @@ async function onTick(w, state, currentPrice) {
             }
 
             const lamports = Math.floor(p.amountSol * LAMPORTS_PER_SOL);
-
             console.log(
                 `\n📈 上穿目标层 ${p.targetIndex}($${targetPrice.toFixed(2)}) → 卖出 P#${p.id} ${p.amountSol.toFixed(4)} SOL`
             );
@@ -365,38 +537,35 @@ async function onTick(w, state, currentPrice) {
             if (r.ok) {
                 state.positions = state.positions.filter((x) => x.id !== p.id);
                 trades++;
+                bumpDailyTrades(state, 1);
                 saveState(w.keypair.publicKey.toBase58(), state);
                 await sleep(POST_TRADE_COOLDOWN_MS);
             }
         }
     }
 
-    // (2) 买入前：确保 USDC 缓冲
+    // 2) 买入前：USDC 缓冲
     await ensureUsdcBuffer(w, state, currentPrice);
 
-    // (3) 再买入：下穿某层，且该层没有持仓，则买入并绑定目标层 i+1
+    // 3) 买入：下穿 entry 层买入，绑定 target=i+1
     for (let i = 0; i < state.grid.levels.length - 1; i++) {
         if (trades >= MAX_TRADES_PER_TICK) break;
 
         const entryPrice = state.grid.levels[i].price;
 
         if (lastPrice >= entryPrice && currentPrice < entryPrice) {
-            if (findOpenPositionByEntryIndex(state, i)) continue;
+            if (countPositionsAtLevel(state, i) >= MAX_POS_PER_LEVEL) continue;
 
-            // 随机 SOL 数量
             let amountSol = randFloat(MIN_TRADE_SOL, MAX_TRADE_SOL);
             amountSol = clamp(amountSol, 0.0001, 1000);
 
-            // 计算需要 USDC
             const needUsdc = amountSol * currentPrice;
             const usdcBal = await getTokenBalanceUI(w, USDC_MINT);
-
             if (usdcBal < needUsdc) {
                 console.warn(`[${w.label}] ⚠️ USDC不足 (${usdcBal.toFixed(2)} < ${needUsdc.toFixed(2)}), 跳过买入`);
                 continue;
             }
 
-            // 还要确保 SOL 有 gas
             const solBal = await getBalanceSOL(w);
             if (solBal < MIN_BALANCE_SOL) {
                 console.warn(`[${w.label}] ⚠️ SOL gas不足 (${solBal.toFixed(4)}), 跳过买入`);
@@ -420,6 +589,7 @@ async function onTick(w, state, currentPrice) {
                     createdAt: Date.now(),
                 });
                 trades++;
+                bumpDailyTrades(state, 1);
                 saveState(w.keypair.publicKey.toBase58(), state);
                 await sleep(POST_TRADE_COOLDOWN_MS);
             }
@@ -427,7 +597,11 @@ async function onTick(w, state, currentPrice) {
     }
 
     state.lastPrice = currentPrice;
-    if (trades > 0) printStatus(state, currentPrice);
+
+    if (trades > 0) {
+        printStatus(state, currentPrice);
+        console.log(`✅ 本tick成交: ${trades} | 今日累计: ${state.daily?.trades ?? 0}`);
+    }
 
     return trades;
 }
@@ -436,31 +610,37 @@ async function onTick(w, state, currentPrice) {
 // 主循环
 // =======================
 async function main() {
-    console.log(`🔥 SOL 网格（相邻层低买高卖 + USDC缓冲自动补仓）启动`);
+    console.log(`🔥 高成交网格启动：Pyth触发 + Jupiter Ultra成交`);
     console.log(`钱包: ${worker.keypair.publicKey.toBase58()}`);
-    console.log(`网格: COUNT=${GRID_COUNT}, RANGE=±${GRID_RANGE_PERCENT}%`);
+    console.log(`Pyth: ${PYTH_HERMES_URL} | query=${PYTH_QUERY} | asset_type=${PYTH_ASSET_TYPE}`);
+    console.log(`网格: COUNT=${GRID_COUNT}, RANGE=±${GRID_RANGE_PERCENT}% | MAX_POS_PER_LEVEL=${MAX_POS_PER_LEVEL}`);
     console.log(`随机下单: SOL ${MIN_TRADE_SOL} ~ ${MAX_TRADE_SOL}`);
-    console.log(`USDC缓冲: TARGET=${TARGET_USDC_BUFFER}, 保留SOL=${MIN_SOL_KEEP}, gas垫=${MIN_BALANCE_SOL}`);
-    console.log(`轮询: ${PRICE_CHECK_INTERVAL_MS / 1000}s, 每tick最多${MAX_TRADES_PER_TICK}笔\n`);
+    console.log(`USDC缓冲: TARGET=${TARGET_USDC_BUFFER} | MIN_SOL_KEEP=${MIN_SOL_KEEP} | MIN_BALANCE_SOL=${MIN_BALANCE_SOL}`);
+    console.log(`轮询: ${PRICE_CHECK_INTERVAL_MS / 1000}s | MAX_TRADES_PER_TICK=${MAX_TRADES_PER_TICK}\n`);
 
     const pk = worker.keypair.publicKey.toBase58();
+
+    console.log("⏳ 解析 Pyth price feed id...");
+    const { id: pythId, meta } = await resolvePythPriceIdStrict();
+    console.log(`✅ Pyth priceId: ${pythId}`);
+    if (meta?.attributes?.symbol || meta?.attributes?.description) {
+        console.log(`   symbol=${meta.attributes.symbol} | desc=${meta.attributes.description}`);
+    } else {
+        console.log(`   symbol/desc: (not provided)`);
+    }
+
+    // ⚠️ 重要：如果你之前用错了 feed（例如 MSOL/USD），请删除 state/ 目录再跑
     let state = loadState(pk);
 
     if (!state) {
-        console.log("⏳ 初始化网格：获取基准价格...");
-        const basePrice = await getSOLPrice(worker);
-        const grid = initGrid(basePrice);
-        state = makeEmptyState(grid, basePrice);
+        console.log("⏳ 初始化网格：获取 Pyth 基准价...");
+        const { price } = await getPythPrice(pythId);
+        state = makeEmptyState(initGrid(price), price);
         saveState(pk, state);
-        console.log(`✅ 初始化完成：base SOL=$${basePrice.toFixed(2)}`);
+        console.log(`✅ 初始化完成：base SOL=$${price.toFixed(2)}`);
     } else {
         console.log("✅ 已加载本地状态：state/ 目录");
     }
-
-    // 打印当前 token account 数量（排查用）
-    const mint = new PublicKey(USDC_MINT);
-    const tokenAccs = await connection.getParsedTokenAccountsByOwner(kp.publicKey, { mint });
-    console.log(`USDC token accounts: ${tokenAccs.value.length}`);
 
     const solBal = await getBalanceSOL(worker);
     const usdcBal = await getTokenBalanceUI(worker, USDC_MINT);
@@ -468,10 +648,16 @@ async function main() {
 
     while (true) {
         try {
-            const price = await getSOLPrice(worker);
+            const { price, publishTime } = await getPythPrice(pythId);
             const ts = new Date().toLocaleString();
             const last = state.lastPrice ?? price;
-            console.log(`[${ts}] 💹 SOL=$${price.toFixed(2)} (last $${last.toFixed(2)})`);
+
+            const lag = publishTime ? Math.floor(Date.now() / 1000) - publishTime : null;
+            const lagStr = lag != null ? ` | lag=${lag}s` : "";
+
+            console.log(
+                `[${ts}] 💹 Pyth SOL=$${price.toFixed(2)} (last $${last.toFixed(2)})${lagStr} | daily=${state.daily?.trades ?? 0}`
+            );
 
             await onTick(worker, state, price);
         } catch (e) {
